@@ -12,6 +12,7 @@ import (
 	"time"
 
 	clustercache "github.com/argoproj/argo-cd/gitops-engine/pkg/cache"
+	"github.com/argoproj/argo-cd/gitops-engine/pkg/diff"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/health"
 	"github.com/argoproj/argo-cd/gitops-engine/pkg/utils/kube/kubetest"
 	"github.com/sirupsen/logrus"
@@ -3544,4 +3545,163 @@ func TestPersistAppStatus_AnnotationManagement(t *testing.T) {
 		assert.True(t, hasOther, "other annotations should be preserved")
 		assert.Equal(t, "other-value", otherValue)
 	})
+}
+
+func newSecretUnstructured(name string, data map[string]string, annotations map[string]string) *unstructured.Unstructured {
+	obj := map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Secret",
+		"metadata": map[string]any{
+			"name":      name,
+			"namespace": "default",
+		},
+		"data": func() map[string]any {
+			m := map[string]any{}
+			for k, v := range data {
+				m[k] = v
+			}
+			return m
+		}(),
+	}
+	if len(annotations) > 0 {
+		annos := map[string]any{}
+		for k, v := range annotations {
+			annos[k] = v
+		}
+		obj["metadata"].(map[string]any)["annotations"] = annos
+	}
+	return &unstructured.Unstructured{Object: obj}
+}
+
+func mustMarshal(t *testing.T, u *unstructured.Unstructured) []byte {
+	t.Helper()
+	if u == nil {
+		return []byte("null")
+	}
+	b, err := json.Marshal(u)
+	require.NoError(t, err)
+	return b
+}
+
+func TestHideSecretDataDiffResult_PreservesModified(t *testing.T) {
+	pred := newSecretUnstructured("s", map[string]string{"k": "dmFsdWU="}, nil)
+	live := newSecretUnstructured("s", map[string]string{"k": "dmFsdWU="}, nil)
+	in := diff.DiffResult{
+		Modified:       false,
+		PredictedLive:  mustMarshal(t, pred),
+		NormalizedLive: mustMarshal(t, live),
+	}
+	out, err := hideSecretDataDiffResult(in, nil)
+	require.NoError(t, err)
+	assert.False(t, out.Modified)
+
+	in.Modified = true
+	out, err = hideSecretDataDiffResult(in, nil)
+	require.NoError(t, err)
+	assert.True(t, out.Modified)
+}
+
+func TestHideSecretDataDiffResult_SymmetricMaskingForEqualPlaintext(t *testing.T) {
+	// vault webhook scenario after removeWebhookMutation: both sides hold the same resolved value.
+	// Symmetric masking must produce byte-identical data sections so no spurious diff appears.
+	pred := newSecretUnstructured("s", map[string]string{"token": "c3VwZXJzZWNyZXQ="}, nil)
+	live := newSecretUnstructured("s", map[string]string{"token": "c3VwZXJzZWNyZXQ="}, nil)
+	in := diff.DiffResult{
+		Modified:       false,
+		PredictedLive:  mustMarshal(t, pred),
+		NormalizedLive: mustMarshal(t, live),
+	}
+	out, err := hideSecretDataDiffResult(in, nil)
+	require.NoError(t, err)
+
+	var predOut, liveOut unstructured.Unstructured
+	require.NoError(t, json.Unmarshal(out.PredictedLive, &predOut.Object))
+	require.NoError(t, json.Unmarshal(out.NormalizedLive, &liveOut.Object))
+	predData, _, _ := unstructured.NestedStringMap(predOut.Object, "data")
+	liveData, _, _ := unstructured.NestedStringMap(liveOut.Object, "data")
+	assert.Equal(t, predData, liveData, "masked data must be byte-identical for equal plaintext")
+	assert.NotEqual(t, "c3VwZXJzZWNyZXQ=", predData["token"], "plaintext must not survive masking")
+}
+
+func TestHideSecretDataDiffResult_DifferentPlaintextsMaskedNoLeak(t *testing.T) {
+	// Legitimate drift scenario: predicted and live hold different plaintexts for the
+	// same key. Modified must stay true (main pass authority), neither plaintext may
+	// survive masking, and the two sides must end up with distinct placeholder values
+	// so the UI still shows a difference without leaking either secret.
+	pred := newSecretUnstructured("s", map[string]string{"token": "cHJlZGljdGVk"}, nil)
+	live := newSecretUnstructured("s", map[string]string{"token": "bGl2ZQ=="}, nil)
+	in := diff.DiffResult{
+		Modified:       true,
+		PredictedLive:  mustMarshal(t, pred),
+		NormalizedLive: mustMarshal(t, live),
+	}
+	out, err := hideSecretDataDiffResult(in, nil)
+	require.NoError(t, err)
+	assert.True(t, out.Modified, "Modified must be preserved from main pass")
+	assert.NotContains(t, string(out.PredictedLive), "cHJlZGljdGVk", "predicted plaintext must not leak")
+	assert.NotContains(t, string(out.NormalizedLive), "bGl2ZQ==", "live plaintext must not leak")
+
+	var predOut, liveOut unstructured.Unstructured
+	require.NoError(t, json.Unmarshal(out.PredictedLive, &predOut.Object))
+	require.NoError(t, json.Unmarshal(out.NormalizedLive, &liveOut.Object))
+	predData, _, _ := unstructured.NestedStringMap(predOut.Object, "data")
+	liveData, _, _ := unstructured.NestedStringMap(liveOut.Object, "data")
+	assert.NotEqual(t, predData["token"], liveData["token"], "distinct plaintexts must yield distinct placeholders")
+}
+
+func TestHideSecretDataDiffResult_SensitiveAnnotationsMasked(t *testing.T) {
+	pred := newSecretUnstructured("s", nil, map[string]string{"sensitive.io/value": "abc"})
+	live := newSecretUnstructured("s", nil, map[string]string{"sensitive.io/value": "abc"})
+	in := diff.DiffResult{
+		Modified:       false,
+		PredictedLive:  mustMarshal(t, pred),
+		NormalizedLive: mustMarshal(t, live),
+	}
+	out, err := hideSecretDataDiffResult(in, map[string]bool{"sensitive.io/value": true})
+	require.NoError(t, err)
+
+	var predOut unstructured.Unstructured
+	require.NoError(t, json.Unmarshal(out.PredictedLive, &predOut.Object))
+	annos, _, _ := unstructured.NestedStringMap(predOut.Object, "metadata", "annotations")
+	assert.NotEqual(t, "abc", annos["sensitive.io/value"], "sensitive annotation must be masked")
+}
+
+func TestHideSecretDataDiffResult_NullSides(t *testing.T) {
+	pred := newSecretUnstructured("s", map[string]string{"k": "dmFsdWU="}, nil)
+
+	// create: live side is null
+	outCreate, err := hideSecretDataDiffResult(diff.DiffResult{
+		Modified:       true,
+		PredictedLive:  mustMarshal(t, pred),
+		NormalizedLive: []byte("null"),
+	}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "null", string(outCreate.NormalizedLive))
+	assert.NotContains(t, string(outCreate.PredictedLive), "dmFsdWU=", "plaintext must not survive masking on create")
+
+	// delete: predicted side is null
+	outDelete, err := hideSecretDataDiffResult(diff.DiffResult{
+		Modified:       false,
+		PredictedLive:  []byte("null"),
+		NormalizedLive: mustMarshal(t, pred),
+	}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "null", string(outDelete.PredictedLive))
+	assert.NotContains(t, string(outDelete.NormalizedLive), "dmFsdWU=", "plaintext must not survive masking on delete")
+}
+
+func TestHideSecretDataDiffResult_EmptyAndInvalid(t *testing.T) {
+	out, err := hideSecretDataDiffResult(diff.DiffResult{
+		Modified:       false,
+		PredictedLive:  nil,
+		NormalizedLive: nil,
+	}, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "null", string(out.PredictedLive))
+	assert.Equal(t, "null", string(out.NormalizedLive))
+
+	_, err = hideSecretDataDiffResult(diff.DiffResult{
+		PredictedLive: []byte("not-json"),
+	}, nil)
+	require.Error(t, err)
 }

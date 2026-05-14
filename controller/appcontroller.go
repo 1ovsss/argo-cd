@@ -59,7 +59,6 @@ import (
 	"github.com/argoproj/argo-cd/v3/reposerver/apiclient"
 	applog "github.com/argoproj/argo-cd/v3/util/app/log"
 	"github.com/argoproj/argo-cd/v3/util/argo"
-	argodiff "github.com/argoproj/argo-cd/v3/util/argo/diff"
 	"github.com/argoproj/argo-cd/v3/util/argo/normalizers"
 	"github.com/argoproj/argo-cd/v3/util/env"
 	"github.com/argoproj/argo-cd/v3/util/stats"
@@ -812,47 +811,18 @@ func (ctrl *ApplicationController) hideSecretData(destCluster *appv1.Cluster, ap
 		resDiff := res.Diff
 		if res.Kind == kube.SecretKind && res.Group == "" {
 			var err error
-			target, live, err = diff.HideSecretData(res.Target, res.Live, ctrl.settingsMgr.GetSensitiveAnnotations())
+			sensitiveAnnotations := ctrl.settingsMgr.GetSensitiveAnnotations()
+			target, live, err = diff.HideSecretData(res.Target, res.Live, sensitiveAnnotations)
 			if err != nil {
 				return nil, fmt.Errorf("error hiding secret data: %w", err)
 			}
-			compareOptions, err := ctrl.settingsMgr.GetResourceCompareOptions()
+			// Mask res.Diff sides as a pair so HideSecretData produces symmetric placeholders;
+			// reuse res.Diff.Modified instead of re-diffing on locally-masked copies (which
+			// caused false drift when mutation webhooks resolved values between target and live).
+			resDiff, err = hideSecretDataDiffResult(res.Diff, sensitiveAnnotations)
 			if err != nil {
-				return nil, fmt.Errorf("error getting resource compare options: %w", err)
+				return nil, fmt.Errorf("error hiding secret data in diff result: %w", err)
 			}
-			resourceOverrides, err := ctrl.settingsMgr.GetResourceOverrides()
-			if err != nil {
-				return nil, fmt.Errorf("error getting resource overrides: %w", err)
-			}
-			appLabelKey, err := ctrl.settingsMgr.GetAppInstanceLabelKey()
-			if err != nil {
-				return nil, fmt.Errorf("error getting app instance label key: %w", err)
-			}
-			trackingMethod, err := ctrl.settingsMgr.GetTrackingMethod()
-			if err != nil {
-				return nil, fmt.Errorf("error getting tracking method: %w", err)
-			}
-
-			clusterCache, err := ctrl.stateCache.GetClusterCache(destCluster)
-			if err != nil {
-				return nil, fmt.Errorf("error getting cluster cache: %w", err)
-			}
-			diffConfig, err := argodiff.NewDiffConfigBuilder().
-				WithDiffSettings(app.Spec.IgnoreDifferences, resourceOverrides, compareOptions.IgnoreAggregatedRoles, ctrl.ignoreNormalizerOpts).
-				WithTracking(appLabelKey, trackingMethod).
-				WithNoCache().
-				WithLogger(logutils.NewLogrusLogger(logutils.NewWithCurrentConfig())).
-				WithGVKParser(clusterCache.GetGVKParser()).
-				Build()
-			if err != nil {
-				return nil, fmt.Errorf("appcontroller error building diff config: %w", err)
-			}
-
-			diffResult, err := argodiff.StateDiff(live, target, diffConfig)
-			if err != nil {
-				return nil, fmt.Errorf("error applying diff: %w", err)
-			}
-			resDiff = diffResult
 		}
 
 		if live != nil {
@@ -881,6 +851,54 @@ func (ctrl *ApplicationController) hideSecretData(destCluster *appv1.Cluster, ap
 		items[i] = &item
 	}
 	return items, nil
+}
+
+// hideSecretDataDiffResult masks Secret data and sensitive annotations on both sides of a
+// DiffResult as a pair so HideSecretData emits symmetric placeholders. Modified is preserved.
+func hideSecretDataDiffResult(d diff.DiffResult, hideAnnotations map[string]bool) (diff.DiffResult, error) {
+	predictedLive, err := unmarshalDiffSide(d.PredictedLive)
+	if err != nil {
+		return diff.DiffResult{}, fmt.Errorf("error unmarshaling predicted live: %w", err)
+	}
+	normalizedLive, err := unmarshalDiffSide(d.NormalizedLive)
+	if err != nil {
+		return diff.DiffResult{}, fmt.Errorf("error unmarshaling normalized live: %w", err)
+	}
+	predictedLive, normalizedLive, err = diff.HideSecretData(predictedLive, normalizedLive, hideAnnotations)
+	if err != nil {
+		return diff.DiffResult{}, err
+	}
+	predictedLiveBytes, err := marshalDiffSide(predictedLive)
+	if err != nil {
+		return diff.DiffResult{}, fmt.Errorf("error marshaling predicted live: %w", err)
+	}
+	normalizedLiveBytes, err := marshalDiffSide(normalizedLive)
+	if err != nil {
+		return diff.DiffResult{}, fmt.Errorf("error marshaling normalized live: %w", err)
+	}
+	return diff.DiffResult{
+		Modified:       d.Modified,
+		PredictedLive:  predictedLiveBytes,
+		NormalizedLive: normalizedLiveBytes,
+	}, nil
+}
+
+func unmarshalDiffSide(data []byte) (*unstructured.Unstructured, error) {
+	if len(data) == 0 || string(data) == "null" {
+		return nil, nil
+	}
+	u := &unstructured.Unstructured{}
+	if err := json.Unmarshal(data, &u.Object); err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+func marshalDiffSide(u *unstructured.Unstructured) ([]byte, error) {
+	if u == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(u)
 }
 
 // Run starts the Application CRD controller.
